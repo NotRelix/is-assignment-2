@@ -1,205 +1,262 @@
+# people_counter.py
 # =======================================================
 # 5.1 INITIALIZATION
 # =======================================================
 
-# Import necessary packages
 from centroidtracker import CentroidTracker
 import numpy as np
 import cv2
-import os # For checking file existence
+import os
+import datetime
 
 # --- MODEL AND CONFIGURATION SETUP ---
-# Paths to YOLO model files (must be in the yolo_model/ directory)
 YOLO_CONFIG = "yolo_model/yolov3.cfg"
 YOLO_WEIGHTS = "yolo_model/yolov3.weights"
 CLASSES_FILE = "yolo_model/coco.names"
 
-# Ensure all YOLO files are present before proceeding
-if not all(os.path.exists(f) for f in [YOLO_CONFIG, YOLO_WEIGHTS, CLASSES_FILE]):
-    print("[ERROR] One or more YOLO model files are missing. Check yolo_model/ directory.")
-    exit()
+# Ensure all YOLO files exist
+for f in [YOLO_CONFIG, YOLO_WEIGHTS, CLASSES_FILE]:
+    if not os.path.exists(f):
+        print(f"[ERROR] Missing: {f}")
+        exit()
 
-# Load the COCO class labels our YOLO model was trained on
+# Load COCO class labels
 with open(CLASSES_FILE, "r") as f:
     classes = [line.strip() for line in f.readlines()]
 
-# Load our YOLO object detector trained on COCO dataset (80 classes)
-print("[INFO] loading YOLO from disk...")
-net = cv2.dnn.readNet(YOLO_WEIGHTS, YOLO_CONFIG)
+print(f"[INFO] Loaded {len(classes)} classes (first 5): {classes[:5]}")
 
-# Get the output layer names that we need from YOLO
-layer_names = net.getLayerNames()
-# Determine the output layer names from the YOLO model
-# This handles both older and newer OpenCV versions
+# --- Load YOLO network ---
+print("[INFO] Loading YOLO from disk...")
+net = cv2.dnn.readNetFromDarknet(YOLO_CONFIG, YOLO_WEIGHTS)
+
+# Try enabling GPU (if OpenCV built with CUDA); fall back to CPU
 try:
-    output_layers = [layer_names[i - 1] for i in net.getUnconnectedOutLayers()]
-except:
-    output_layers = [layer_names[i[0] - 1] for i in net.getUnconnectedOutLayers()]
+    net.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
+    net.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA)
+    print("[INFO] Using GPU (CUDA) backend for DNN")
+except Exception as e:
+    print("[INFO] Using CPU backend for DNN:", e)
 
-# Filter to keep only the 'person' class ID (COCO dataset has 80 classes, person is often index 0)
-# We find the index of "person" in the loaded classes list
+# --- Output layers (robust to OpenCV versions) ---
+layer_names = net.getLayerNames()
+outs = net.getUnconnectedOutLayers()
+outs_flat = np.array(outs).flatten()
+output_layers = [layer_names[i - 1] for i in outs_flat]
+print("[DEBUG] Output layers:", output_layers)
+
+# --- Detection thresholds (you can tweak) ---
+if "person" not in classes:
+    print("[ERROR] 'person' not found in classes. Check coco.names.")
+    exit()
 PERSON_CLASS_ID = classes.index("person")
-CONFIDENCE_THRESHOLD = 0.5
-NMS_THRESHOLD = 0.3 # Non-Maximum Suppression threshold
 
-# --- VIDEO I/O AND TRACKER SETUP ---
-INPUT_VIDEO_PATH = "input/input_video.mp4"
+CONFIDENCE_THRESHOLD = 0.2   # final confidence threshold (objectness * class_prob)
+NMS_THRESHOLD = 0.4
+
+# --- VIDEO INPUT/OUTPUT ---
+INPUT_VIDEO_PATH = "input/input_video.mov"
 OUTPUT_VIDEO_PATH = "output/output_video.mp4"
 
-# Initialize video capture from file and get its properties
 vs = cv2.VideoCapture(INPUT_VIDEO_PATH)
+if not vs.isOpened():
+    print(f"[ERROR] Could not open input video: {INPUT_VIDEO_PATH}")
+    exit()
+
 writer = None
 (W, H) = (None, None)
 
-# Initialize our centroid tracker and a list to store each tracked object
+# Initialize tracker and variables
 ct = CentroidTracker(maxDisappeared=40)
+trackableObjects = {}
+totalLeft = 0
+totalRight = 0
 
-# Dictionary to store the trajectory history and counted status of each object
-# { objectID: { "centroids": [centroid1, centroid2, ...], "counted": False } }
-trackableObjects = {} 
-
-# Initialize the total number of people who have moved up or down
-totalDown = 0   # Corresponds to "Entering" if line is horizontal and camera is elevated
-totalUp = 0     # Corresponds to "Exiting" if line is horizontal and camera is elevated
-
-# Position of the virtual counting line (e.g., center of the frame)
-# We use H // 2 for a horizontal line in the middle
-Y_LINE_POS = 0 
-
+print("[INFO] Starting video stream...")
 
 # =======================================================
-# 5.2 THE MAIN PROCESSING LOOP
+# 5.2 MAIN LOOP (Turnstile-Style)
 # =======================================================
 
-print("[INFO] starting video stream...")
-# Loop over frames from the video stream
+GATE_LEFT = GATE_RIGHT = GATE_TOP = GATE_BOTTOM = None
+GATE_WIDTH = 250
+FRAME_MIN_DIM = 416  # minimum width/height to ensure detection scale is okay
+
+frame_idx = 0
+no_detection_saved = False
+
 while True:
-    # Read the next frame from the file
     (grabbed, frame) = vs.read()
-
-    # If the frame was not grabbed, then we have reached the end of the stream
     if not grabbed:
+        print("[INFO] End of video file reached.")
         break
 
-    # If the frame dimensions are empty, set them and the line position
+    frame_idx += 1
+
+    # Upscale very small frames so YOLO sees reasonable input
+    if frame.shape[1] < FRAME_MIN_DIM or frame.shape[0] < FRAME_MIN_DIM:
+        scale_x = max(1, FRAME_MIN_DIM / frame.shape[1])
+        scale_y = max(1, FRAME_MIN_DIM / frame.shape[0])
+        scale = max(scale_x, scale_y)
+        new_w = int(frame.shape[1] * scale)
+        new_h = int(frame.shape[0] * scale)
+        frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
     if W is None or H is None:
         (H, W) = frame.shape[:2]
-        # Set the virtual line position to the center of the frame
-        Y_LINE_POS = H // 2
+        X_CENTER = W // 2
+        GATE_LEFT = X_CENTER - (GATE_WIDTH // 2)
+        GATE_RIGHT = X_CENTER + (GATE_WIDTH // 2)
+        GATE_TOP = int(H * 0.7)
+        GATE_BOTTOM = int(H * 1.5)
 
-    # --- DETECTION PHASE (YOLO) ---
-    rects = [] # List to store valid bounding boxes for the tracker
+    rects = []
 
-    # Construct a blob from the input frame
+    # Optional: brighten dark frames
+    gray_tmp = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    mean_brightness = gray_tmp.mean()
+    if mean_brightness < 50:
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        gray_enh = clahe.apply(gray_tmp)
+        frame = cv2.cvtColor(gray_enh, cv2.COLOR_GRAY2BGR)
+        print(f"[DEBUG] Applied CLAHE on frame {frame_idx} (mean brightness {mean_brightness:.1f})")
+
+    # --- YOLO detection ---
     blob = cv2.dnn.blobFromImage(frame, 1 / 255.0, (416, 416), swapRB=True, crop=False)
     net.setInput(blob)
     detections = net.forward(output_layers)
 
-    # Lists for Non-Maximum Suppression (NMS)
-    boxes = []
-    confidences = []
-    classIDs = []
+    boxes, confidences = [], []
 
-    # Loop over each of the layer outputs
+    # debug counters
+    raw_detections = 0
+    person_candidates = 0
+
     for output in detections:
-        # Loop over each of the detections
         for detection in output:
+            raw_detections += 1
+            # detection format: [center_x, center_y, width, height, objectness, class_probs...]
+            objectness = float(detection[4])
             scores = detection[5:]
-            classID = np.argmax(scores)
-            confidence = scores[classID]
+            classID = int(np.argmax(scores))
+            class_prob = float(scores[classID])
+            # IMPORTANT: multiply objectness by class probability
+            confidence = objectness * class_prob
 
-            # Filter detections to keep only "person" class with high confidence
+            # debug: show some detected values for first few raw detections
+            if raw_detections <= 5:
+                print(f"[RAW] det#{raw_detections}: obj={objectness:.3f} cls={classes[classID]}({classID}) cls_prob={class_prob:.3f} final_conf={confidence:.3f}")
+
+            # only consider final confidence and 'person' class
             if classID == PERSON_CLASS_ID and confidence > CONFIDENCE_THRESHOLD:
-                # Scale the bounding box coordinates back to the image size
+                person_candidates += 1
                 box = detection[0:4] * np.array([W, H, W, H])
                 (centerX, centerY, width, height) = box.astype("int")
 
-                # Use the center (x, y)-coordinates to derive the top and left corner
-                x = int(centerX - (width / 2))
-                y = int(centerY - (height / 2))
+                # clamp & sanity-check
+                w = max(1, int(width))
+                h = max(1, int(height))
+                x = int(centerX - (w / 2))
+                y = int(centerY - (h / 2))
+                x = max(0, x)
+                y = max(0, y)
+                if x + w > W:
+                    w = W - x
+                if y + h > H:
+                    h = H - y
 
-                # Add the detection to the NMS lists
-                boxes.append([x, y, int(width), int(height)])
-                confidences.append(float(confidence))
-                classIDs.append(classID)
+                # if tiny, skip (you can lower these if your people are very small)
+                if w < 10 or h < 20:
+                    continue
 
-    # Apply Non-Maximum Suppression (NMS) to suppress weak, overlapping bounding boxes
-    idxs = cv2.dnn.NMSBoxes(boxes, confidences, CONFIDENCE_THRESHOLD, NMS_THRESHOLD)
+                boxes.append([x, y, int(w), int(h)])
+                confidences.append(confidence)
 
-    # Loop over the remaining detections after NMS
+    # NMS handling
+    idxs = []
+    if len(boxes) > 0:
+        try:
+            idxs_raw = cv2.dnn.NMSBoxes(boxes, confidences, CONFIDENCE_THRESHOLD, NMS_THRESHOLD)
+            if isinstance(idxs_raw, (tuple, list, np.ndarray)) and len(idxs_raw) > 0:
+                idxs = np.array(idxs_raw).flatten()
+            else:
+                idxs = []
+        except Exception as e:
+            print("[WARN] NMSBoxes exception:", e)
+            idxs = list(range(len(boxes)))
+
+    print(f"[DEBUG] Frame {frame_idx}: raw={raw_detections} person_cand={person_candidates} boxes={len(boxes)} kept_after_nms={len(idxs)}")
+
+    # Save one debug frame if nothing detected to inspect visually
+    if len(idxs) == 0 and (frame_idx % 30 == 0) and not no_detection_saved:
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        save_path = f"debug_no_detections_{ts}.jpg"
+        cv2.imwrite(save_path, frame)
+        print(f"[DEBUG] Saved frame with no detections to {save_path} for inspection")
+        no_detection_saved = True
+
     if len(idxs) > 0:
-        for i in idxs.flatten():
-            # Extract the bounding box coordinates
-            (x, y) = (boxes[i][0], boxes[i][1])
-            (w, h) = (boxes[i][2], boxes[i][3])
-            
-            # Add the bounding box in [startX, startY, endX, endY] format to our list for the tracker
+        for i in idxs:
+            i = int(i)
+            (x, y, w, h) = boxes[i]
             rects.append((x, y, x + w, y + h))
+            conf = confidences[i] if i < len(confidences) else 0.0
+            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+            cv2.putText(frame, f"person {conf:.2f}", (x, y - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
-    # --- TRACKING PHASE ---
-    # Update our centroid tracker using the computed set of bounding box rectangles
+    # --- Tracker update ---
     objects = ct.update(rects)
 
-    # --- COUNTING AND VISUALIZATION PHASE ---
-    # Draw a horizontal line in the center of the frame (the virtual gate)
-    cv2.line(frame, (0, Y_LINE_POS), (W, Y_LINE_POS), (0, 255, 255), 2) # Yellow Line
+    # Draw gate zone
+    cv2.rectangle(frame, (GATE_LEFT, GATE_TOP), (GATE_RIGHT, GATE_BOTTOM), (0, 255, 255), 2)
+    cv2.putText(frame, "GATE ZONE", (GATE_LEFT - 10, GATE_TOP - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
 
-    # Loop over the tracked objects
     for (objectID, centroid) in objects.items():
-        # Check to see if a trackable object exists for the current object ID
         to = trackableObjects.get(objectID, None)
-
-        # 1. If there is no existing trackable object, create one
         if to is None:
-            # We store the centroid history and a 'counted' flag
             to = {"centroids": [centroid], "counted": False}
-        
-        # 2. The object was tracked. Check direction and count.
         else:
-            # Calculate direction by comparing current y-centroid to the mean of previous y-centroids
-            # A negative value means the object is moving "up" (decreasing y-coordinate)
-            # A positive value means the object is moving "down" (increasing y-coordinate)
-            
-            # Get the y-coordinates of the centroid history
-            y_centroids = [c[1] for c in to["centroids"]]
-            
-            # Calculate the direction vector (current_y - mean_previous_y)
-            direction_y = centroid[1] - np.mean(y_centroids)
-
-            # Store the current centroid for next frame's comparison
+            prev_x = [c[0] for c in to["centroids"]]
+            direction_x = centroid[0] - np.mean(prev_x) if len(prev_x) > 0 else 0
             to["centroids"].append(centroid)
 
-            # Check to see if the object has been counted or not
             if not to["counted"]:
-                
-                # Entering Event (Moving DOWN and crossed the line)
-                # Previous mean Y-coord was ABOVE the line, current Y-coord is BELOW the line
-                # direction_y > 0 means moving down
-                if direction_y > 0 and centroid[1] > Y_LINE_POS:
-                    totalDown += 1 # Increment "Entering" counter
-                    to["counted"] = True # Prevent double counting
+                inside_gate = GATE_LEFT <= centroid[0] <= GATE_RIGHT and GATE_TOP <= centroid[1] <= GATE_BOTTOM
 
-                # Exiting Event (Moving UP and crossed the line)
-                # Previous mean Y-coord was BELOW the line, current Y-coord is ABOVE the line
-                # direction_y < 0 means moving up
-                elif direction_y < 0 and centroid[1] < Y_LINE_POS:
-                    totalUp += 1 # Increment "Exiting" counter
-                    to["counted"] = True # Prevent double counting
-        
-        # Store the trackable object back in our dictionary
+                if direction_x < -5 and not inside_gate and np.mean(prev_x) > GATE_RIGHT:
+                    totalLeft += 1
+                    to["counted"] = True
+                    print(f"[GATE] ID {objectID} passed RIGHT→LEFT | totalLeft={totalLeft}")
+                elif direction_x > 5 and not inside_gate and np.mean(prev_x) < GATE_LEFT:
+                    totalRight += 1
+                    to["counted"] = True
+                    print(f"[GATE] ID {objectID} passed LEFT→RIGHT | totalRight={totalRight}")
+
         trackableObjects[objectID] = to
 
-        # Draw both the ID of the object and the centroid of the object on the output frame
-        text = "ID {}".format(objectID)
-        cv2.putText(frame, text, (centroid[0] - 10, centroid[1] - 10),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2) # Green ID
+        cv2.putText(frame, f"ID {objectID}", (centroid[0] - 10, centroid[1] - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
         cv2.circle(frame, (centroid[0], centroid[1]), 4, (0, 255, 0), -1)
 
-    # --- VISUALIZATION (COUNTERS) ---
-    # Construct a tuple of information we will display on the frame
-    info = [
-        ("Exiting", totalUp),
-        ("Entering", totalDown),
-    ]
+    # --- Display counters ---
+    info = [("Exited (Right→Left)", totalLeft), ("Entered (Left→Right)", totalRight)]
+    for (i, (k, v)) in enumerate(info):
+        cv2.putText(frame, f"{k}: {v}", (10, (i * 25) + 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
-    # Loop over the info tuples and draw them
+    # --- Init writer ---
+    if writer is None:
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(OUTPUT_VIDEO_PATH, fourcc, 30, (W, H), True)
+
+    writer.write(frame)
+    cv2.imshow("Processing...", cv2.resize(frame, (800, 600)))
+    if cv2.waitKey(1) & 0xFF == ord("q"):
+        break
+
+print("[INFO] Cleaning up...")
+writer.release()
+vs.release()
+cv2.destroyAllWindows()
