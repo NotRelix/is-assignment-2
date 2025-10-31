@@ -1,0 +1,16 @@
+# =======================================================
+# MANUAL DOWNLOAD INSTRUCTIONS FOR LARGE ASSETS
+# =======================================================
+
+The yolov3.weights file is too large (248 MB) to be stored in the Git repository.
+For the 'people_counter.py' script to run, this file must be downloaded manually and placed in this 'yolo_model/' directory.
+
+**FILE REQUIRED:** yolov3.weights
+
+**DOWNLOAD URL:**
+The file was downloaded from the following Kaggle dataset:
+https://www.kaggle.com/datasets/shivam316/yolov3-weights
+
+Please click the "Download dataset as zip (231 MB)" button on that page, extract the 'yolov3.weights' file, and place it directly into this 'yolo_model/' folder.
+
+# =======================================================
