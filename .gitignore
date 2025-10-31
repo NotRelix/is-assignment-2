@@ -1,0 +1,10 @@
+venv/
+.env/
+
+/input/*
+/output/*
+
+/yolo_model/*.weights
+
+__pycache__/
+*.pyc
